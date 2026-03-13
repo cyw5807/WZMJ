@@ -1,0 +1,101 @@
+# ======================
+# Cocos Creator (wzmj-client)
+# ======================
+# Cocos Creator temp files
+wzmj-client/temp/
+wzmj-client/library/
+wzmj-client/profiles/
+wzmj-client/settings/
+
+# Node modules
+wzmj-client/node_modules/
+wzmj-client/package-lock.json
+
+# Build outputs
+wzmj-client/build/
+wzmj-client/dist/
+
+# TypeScript cache
+wzmj-client/*.tsbuildinfo
+
+# ======================
+# Java/Maven (wzmj-server)
+# ======================
+# Maven target directory
+wzmj-server/target/
+
+# Compiled class files
+wzmj-server/**/*.class
+
+# Maven logs
+wzmj-server/*.log
+
+# IDE specific files for Maven
+wzmj-server/.idea/
+wzmj-server/mvnw
+wzmj-server/mvnw.cmd
+
+# ======================
+# IDE - IntelliJ IDEA
+# ======================
+*.iml
+.idea/
+*.ipr
+*.iws
+
+# ======================
+# IDE - Visual Studio Code
+# ======================
+.vscode/
+*.code-workspace
+
+# ======================
+# IDE - Eclipse
+# ======================
+.classpath
+.project
+.settings/
+.bin/
+
+# ======================
+# OS generated files
+# ======================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+*~
+
+# ======================
+# Logs and databases
+# ======================
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# ======================
+# Environment variables
+# ======================
+.env
+.env.local
+.env.*.local
+
+# ======================
+# Proto generated files (if any)
+# ======================
+**/generated-sources/
+
+# ======================
+# private
+# ======================
+command.txt
