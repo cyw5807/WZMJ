@@ -2,30 +2,36 @@ export const enum ActionType {
   DRAW = "DRAW",
   DISCARD = "DISCARD",
   PONG = "PONG",
-  KONG = "KONG",
+  MING_GANG = "MING_GANG",
   HU = "HU",
   CHI = "CHI",
   PASS = "PASS",
+  AN_GANG = "AN_GANG",
+  BU_GANG = "BU_GANG",
 }
 
 export const encodeActionType: { [key: string]: number } = {
   DRAW: 0,
   DISCARD: 1,
   PONG: 2,
-  KONG: 3,
+  MING_GANG: 3,
   HU: 4,
   CHI: 5,
   PASS: 6,
+  AN_GANG: 7,
+  BU_GANG: 8,
 };
 
 export const decodeActionType: { [key: number]: ActionType } = {
   0: ActionType.DRAW,
   1: ActionType.DISCARD,
   2: ActionType.PONG,
-  3: ActionType.KONG,
+  3: ActionType.MING_GANG,
   4: ActionType.HU,
   5: ActionType.CHI,
   6: ActionType.PASS,
+  7: ActionType.AN_GANG,
+  8: ActionType.BU_GANG,
 };
 
 export interface CardInfo {
@@ -92,6 +98,7 @@ function _decodeCardInfo(bb: ByteBuffer): CardInfo {
 export interface CardSet {
   type?: ActionType;
   cards?: CardInfo[];
+  targetCard?: CardInfo;
 }
 
 export function encodeCardSet(message: CardSet): Uint8Array {
@@ -120,6 +127,17 @@ function _encodeCardSet(message: CardSet, bb: ByteBuffer): void {
       pushByteBuffer(nested);
     }
   }
+
+  // optional CardInfo targetCard = 3;
+  let $targetCard = message.targetCard;
+  if ($targetCard !== undefined) {
+    writeVarint32(bb, 26);
+    let nested = popByteBuffer();
+    _encodeCardInfo($targetCard, nested);
+    writeVarint32(bb, nested.limit);
+    writeByteBuffer(bb, nested);
+    pushByteBuffer(nested);
+  }
 }
 
 export function decodeCardSet(binary: Uint8Array): CardSet {
@@ -147,6 +165,14 @@ function _decodeCardSet(bb: ByteBuffer): CardSet {
         let limit = pushTemporaryLength(bb);
         let values = message.cards || (message.cards = []);
         values.push(_decodeCardInfo(bb));
+        bb.limit = limit;
+        break;
+      }
+
+      // optional CardInfo targetCard = 3;
+      case 3: {
+        let limit = pushTemporaryLength(bb);
+        message.targetCard = _decodeCardInfo(bb);
         bb.limit = limit;
         break;
       }
@@ -1058,6 +1084,7 @@ export interface PlayerRoundScore {
   nickname?: string;
   scoreChange?: number;
   currentTotalScore?: number;
+  jokerCount?: number;
 }
 
 export function encodePlayerRoundScore(message: PlayerRoundScore): Uint8Array {
@@ -1093,6 +1120,13 @@ function _encodePlayerRoundScore(message: PlayerRoundScore, bb: ByteBuffer): voi
   if ($currentTotalScore !== undefined) {
     writeVarint32(bb, 32);
     writeVarint64(bb, intToLong($currentTotalScore));
+  }
+
+  // optional int32 jokerCount = 5;
+  let $jokerCount = message.jokerCount;
+  if ($jokerCount !== undefined) {
+    writeVarint32(bb, 40);
+    writeVarint64(bb, intToLong($jokerCount));
   }
 }
 
@@ -1131,6 +1165,12 @@ function _decodePlayerRoundScore(bb: ByteBuffer): PlayerRoundScore {
       // optional int32 currentTotalScore = 4;
       case 4: {
         message.currentTotalScore = readVarint32(bb);
+        break;
+      }
+
+      // optional int32 jokerCount = 5;
+      case 5: {
+        message.jokerCount = readVarint32(bb);
         break;
       }
 

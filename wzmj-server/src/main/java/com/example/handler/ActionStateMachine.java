@@ -7,132 +7,251 @@ import com.example.model.PendingAction;
 import msg.GameMessage.CardInfo;
 
 /**
- * 多人动作拦截状态机
+ * 带有前瞻预测与动态截断功能的多人动作拦截状态机
  */
 public class ActionStateMachine {
-    // 动作缓冲区：记录当前回合收到的所有有效拦截动作 (Key: 座位号)
+    // 动作缓冲区：记录当前回合收到的拦截动作
     private Map<Integer, PendingAction> actionBuffer = new HashMap<>();
     
-    // 状态机是否正在等待拦截
+    // 前瞻预测表：记录每个玩家在当前窗口被允许做出的最高优先级动作
+    private Map<Integer, Integer> expectedMaxPriorities = new HashMap<>(); 
+
     private boolean isIntercepting = false; 
-    
-    // 核心开关：是否允许“吃”逻辑 (可随时改为 false 关闭)
     private boolean isChiEnabled = true;
 
-    // 触发结算所需的响应总数 (通常是总人数 - 1，即除了出牌者之外的所有人)
-    private int requiredResponses = 0;
-
-    // 记录出牌人的座位和总人数，用于计算冲突时的座位距离
     private int currentDiscarderSeat = 0;
     private int totalRoomPlayers = 4;
+    private int requiredResponses = 0;
+
+    // 抢杠胡专属数据
+    private boolean isQiangGangMode = false;
+    private CardInfo currentTargetCard = null;
+
+    private GameController gameController;
+
+    public ActionStateMachine(GameController gameController) {
+        this.gameController = gameController;
+    }
 
     /**
-     * 开启拦截收集窗口
-     * 增加出牌人座位参数
+     * 将动作代码转化为绝对优先级权重用于数学比较
      */
-    public void startInterceptWindow(int totalPlayers, int discarderSeat) {
+    private int getPriorityWeight(int actionCode) {
+        if (actionCode == 4) return 40; // 胡 (最高优先级)
+        if (actionCode == 3 || actionCode == 2) return 20; // 碰/明杠 (同级优先级，靠距离决胜)
+        if (actionCode == 5) return 10; // 吃 (最低优先级)
+        return 0; // 过/放弃 (无优先级)
+    }
+
+    /**
+     * 1. 开启常规出牌拦截窗口
+     */
+    public void startInterceptWindow(int totalPlayers, int discarderSeat, CardInfo targetCard, Map<Integer, Integer> expectedPriorities) {
         this.actionBuffer.clear();
-        this.isIntercepting = true;
+        this.expectedMaxPriorities.clear();
         
-        // 极度严谨的数值兜底
+        this.isIntercepting = true;
+        this.isQiangGangMode = false;
+        // 无论是否抢杠胡，状态机都必须死死记住这张目标牌！
+        this.currentTargetCard = targetCard; 
+        
         this.totalRoomPlayers = Math.max(2, totalPlayers);
         this.currentDiscarderSeat = Math.max(0, discarderSeat);
+
+        if (expectedPriorities != null && !expectedPriorities.isEmpty()) {
+            // ... 保持原有逻辑不变
+            this.expectedMaxPriorities.putAll(expectedPriorities);
+            this.requiredResponses = 0;
+            for (int expectedAction : this.expectedMaxPriorities.values()) {
+                if (getPriorityWeight(expectedAction) > 0) {
+                    this.requiredResponses++;
+                }
+            }
+        } else {
+            // 安全降级：强制硬等所有人
+            this.requiredResponses = this.totalRoomPlayers - 1;
+            for (int i = 0; i < this.totalRoomPlayers; i++) {
+                if (i != this.currentDiscarderSeat) {
+                    this.expectedMaxPriorities.put(i, 4); 
+                }
+            }
+        }
         
-        this.requiredResponses = this.totalRoomPlayers - 1; 
-        
-        System.out.println("【状态机】玩家 " + this.currentDiscarderSeat + " 出牌，开启拦截窗口，等待 " + this.requiredResponses + " 名玩家响应...");
+        System.out.println("【状态机】拦截通道开启！理论预期等待 " + this.requiredResponses + " 名玩家响应...");
     }
 
     /**
-     * 接收玩家发来的动作指令
+     * 2. 开启抢杠胡专用拦截窗口
+     */
+    public void startQiangGangIntercept(int discarderSeat, CardInfo targetCard, int totalPlayers, Map<Integer, Integer> expectedPriorities) {
+        // 复用常规窗口的初始化逻辑，传入 targetCard
+        startInterceptWindow(totalPlayers, discarderSeat, targetCard, expectedPriorities);
+        
+        // 追加抢杠专属属性
+        this.isQiangGangMode = true;
+        System.out.println("【状态机】抢杠拦截开启！挂起补杠操作，等待全场判定...");
+    }
+
+    /**
+     * 接收并验证玩家指令
      */
     public void receiveAction(int seatIndex, int actionCode, int totalFan, List<String> fanNames, List<CardInfo> extraCards) {
-        // 1. 如果窗口已关闭，丢弃该消息
         if (!this.isIntercepting) return;
 
-        // 2. 数值安全清洗
         int safeActionCode = Math.max(0, actionCode);
-        
-        // 3. 动态“吃”逻辑降级：如果未开启吃功能，把吃(5)强制降级为过(6)
-        if (!this.isChiEnabled && safeActionCode == 5) {
-            safeActionCode = 6; 
-        }
+        if (!this.isChiEnabled && safeActionCode == 5) safeActionCode = 6;
 
-        // 4. 生成安全的动作对象并存入缓冲区
+        // 存入缓冲区
         PendingAction action = new PendingAction(seatIndex, safeActionCode, totalFan, fanNames, extraCards);
-        this.actionBuffer.put(action.seatIndex, action);
+        this.actionBuffer.put(seatIndex, action);
         
-        System.out.println("【状态机】收到玩家 " + action.seatIndex + " 的动作: " + action.actionCode + " | 当前已收集: " + this.actionBuffer.size() + "/" + this.requiredResponses);
+        System.out.println("【状态机】收到座位 " + seatIndex + " 的动作: " + actionCode);
 
-        // 5. 检查是否所有人（除出牌者外）都已经做出了选择
-        if (this.actionBuffer.size() >= this.requiredResponses) {
-            System.out.println("【状态机】收集完毕！开始执行优先级比较...");
-            resolveHighestPriorityAction();
-        }
+        // 每收到一个动作，立刻触发数学截断推演！
+        checkShortCircuitAndResolve();
     }
 
     /**
-     * 关闭窗口，清理数据
+     * 3. 核心算法：短路截断与动态结算
      */
-    public void resetMachine() {
-        this.isIntercepting = false;
-        this.actionBuffer.clear();
-    }
+    private void checkShortCircuitAndResolve() {
+        int currentBestWeight = 0;
+        PendingAction currentBestAction = null;
+        int currentBestDistance = 999;
 
-    /**
-     * 内部结算：选出优先级最高的操作执行
-     * @return 返回最终胜出的动作（如果所有人都点了“过”，则返回 null）
-     */
-    public PendingAction resolveHighestPriorityAction() {
-        // 1. 关闭收集窗口，防止重复触发
-        this.isIntercepting = false; 
-        
-        PendingAction bestAction = null;
-        int maxPriority = 0;
-        int minDistance = 999; // 记录离出牌人的顺位距离，越小越优先
-
-        // 2. 遍历缓冲区里的所有动作
+        // 【遍历 A】扫描当前缓冲区，找出已知最优解
         for (PendingAction action : this.actionBuffer.values()) {
-            
-            // 如果玩家点了“过”(priority == 0)，直接跳过不参与竞争
-            if (action.priority <= 0) {
-                continue;
-            }
+            int weight = getPriorityWeight(action.actionCode);
+            if (weight <= 0) continue;
 
-            // 距离计算公式：(当前动作发起者座位 - 出牌者座位 + 总人数) % 总人数
-            // 例如：0号出牌，1号的距离是 1，2号的距离是 2，3号的距离是 3
+            // 顺位距离公式：(当前动作玩家 - 出牌玩家 + 总人数) % 总人数
             int distance = (action.seatIndex - this.currentDiscarderSeat + this.totalRoomPlayers) % this.totalRoomPlayers;
-            
-            // 安全防范距离计算异常
-            int safeDistance = Math.max(1, distance);
+            if (distance <= 0) distance += this.totalRoomPlayers; 
 
-            // 3. 优先级比较逻辑
-            if (action.priority > maxPriority) {
-                // 场景 A：绝对优先级压制（比如胡压倒碰）
-                maxPriority = action.priority;
-                bestAction = action;
-                minDistance = safeDistance;
-            } 
-            else if (action.priority == maxPriority && maxPriority > 0) {
-                // 场景 B：同级冲突（比如两人同时抢胡）
-                // 此时比较谁离出牌人更近（截胡原则）
-                if (safeDistance < minDistance) {
-                    bestAction = action;
-                    minDistance = safeDistance;
+            if (weight > currentBestWeight) {
+                currentBestWeight = weight;
+                currentBestAction = action;
+                currentBestDistance = distance;
+            } else if (weight == currentBestWeight) {
+                if (distance < currentBestDistance) {
+                    currentBestAction = action;
+                    currentBestDistance = distance;
                 }
             }
         }
 
-        // 4. 打印最终筛选结果
-        if (bestAction != null) {
-            System.out.println("【状态机】筛选完成！胜出者: 座位 " + bestAction.seatIndex + "，动作: " + bestAction.actionCode);
-        } else {
-            System.out.println("【状态机】筛选完成！所有人都选择了“过”或没有有效动作。");
+        // 【遍历 B】扫描还没回复的玩家，找出他们的“理论最大威胁”
+        int pendingBestWeight = 0;
+        int pendingBestDistance = 999;
+
+        for (Map.Entry<Integer, Integer> entry : this.expectedMaxPriorities.entrySet()) {
+            int pendingSeat = entry.getKey();
+            
+            // 如果这个玩家还没回复
+            if (!this.actionBuffer.containsKey(pendingSeat)) {
+                int expectedAction = entry.getValue();
+                int weight = getPriorityWeight(expectedAction);
+                
+                if (weight > 0) {
+                    int distance = (pendingSeat - this.currentDiscarderSeat + this.totalRoomPlayers) % this.totalRoomPlayers;
+                    if (distance <= 0) distance += this.totalRoomPlayers;
+
+                    if (weight > pendingBestWeight) {
+                        pendingBestWeight = weight;
+                        pendingBestDistance = distance;
+                    } else if (weight == pendingBestWeight) {
+                        if (distance < pendingBestDistance) {
+                            pendingBestDistance = distance;
+                        }
+                    }
+                }
+            }
         }
 
-        return bestAction;
+        // 【决断 C】执行短路判定
+        boolean shouldResolve = false;
+
+        if (this.actionBuffer.size() >= this.requiredResponses) {
+            // 常规结局：所有该回答的人都回答了
+            shouldResolve = true;
+        } else if (currentBestAction != null) {
+            if (currentBestWeight > pendingBestWeight) {
+                // 绝对碾压：当前动作（如碰）大于剩下玩家能做的极限（如吃） -> 瞬间截断！
+                System.out.println("【状态机】触发绝对截断！最优操作已无可撼动，跳过未操作玩家。");
+                shouldResolve = true;
+            } else if (currentBestWeight == pendingBestWeight && currentBestDistance < pendingBestDistance) {
+                // 距离压制：当前动作（如顺位近的胡）与剩下的极限（顺位远的胡）同级，但距离更近 -> 瞬间截断！
+                System.out.println("【状态机】触发距离截断！当前玩家拥有顺位优先权，跳过未操作玩家。");
+                shouldResolve = true;
+            }
+        }
+
+        // 满足任何结算条件，立即关闭机器并返回结果
+        if (shouldResolve) {
+            executeFinalResolution(currentBestAction);
+        }
+    }
+
+    /**
+     * 彻底关闭窗口并处理结算分发
+     */
+    private void executeFinalResolution(PendingAction bestAction) {
+        this.isIntercepting = false;
+        
+        if (bestAction != null) {
+            System.out.println("【状态机】计算完毕！最终执行者: 座位 " + bestAction.seatIndex + "，动作: " + bestAction.actionCode);
+            
+            int seatIndex = bestAction.seatIndex;
+            int actionCode = bestAction.actionCode;
+
+            // 根据状态机算出的最优动作，回调 GameController 执行实际的数据流转
+            if (actionCode == 4) {
+                // 执行胡牌结算 (参数传入是否为抢杠胡，以及收集到的番数)
+                this.gameController.executeInterceptHu(seatIndex, this.currentTargetCard, this.isQiangGangMode, bestAction.totalFan, bestAction.fanNames);
+            } else if (actionCode == 3) {
+                // 执行明杠
+                this.gameController.executeMingGang(seatIndex, this.currentTargetCard);
+            } else if (actionCode == 2) {
+                // 执行碰牌
+                this.gameController.executePong(seatIndex, this.currentTargetCard);
+            } else if (actionCode == 5) {
+                // 执行吃牌 (带上玩家选择的两张辅助牌)
+                this.gameController.executeChi(seatIndex, this.currentTargetCard, bestAction.extraCards);
+            }
+            
+        } else {
+            System.out.println("【状态机】计算完毕！所有人放弃操作，拦截通道放行。");
+            
+            // 【抢杠胡专属收尾】：无人抢胡，释放被挂起的补杠流程
+            if (this.isQiangGangMode) {
+                System.out.println("【状态机】抢杠胡无人响应，给原补杠玩家发放岭上牌...");
+                // 回调控制器，直接将岭上牌塞给当时触发补杠的玩家
+                this.gameController.executeReplacementDraw(this.currentDiscarderSeat);
+            } 
+            // 常规打牌拦截收尾：无人拦截，流转给下家摸牌
+            else {
+                System.out.println("【状态机】常规出牌无人拦截，通知下家摸牌...");
+                this.gameController.executeNextPlayerDraw();
+            }
+        }
+        
+        // 结算完成后，彻底重置并清理状态机内存
+        this.resetMachine();
+    }
+
+    /**
+     * 清理状态
+     */
+    public void resetMachine() {
+        this.isIntercepting = false;
+        this.isQiangGangMode = false;
+        this.currentTargetCard = null;
+        this.actionBuffer.clear();
+        this.expectedMaxPriorities.clear();
     }
 
     // --- 状态访问器 ---
     public boolean isIntercepting() { return isIntercepting; }
+    public boolean isQiangGangMode() { return isQiangGangMode; }
+    public CardInfo getCurrentTargetCard() { return currentTargetCard; }
 }

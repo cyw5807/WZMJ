@@ -6,7 +6,6 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 import com.example.model.Player;
-import com.example.model.PendingAction;
 import io.netty.channel.ChannelHandlerContext;
 import msg.GameMessage.*;
 
@@ -115,46 +114,49 @@ public class MsgDispatcher {
             int currentActionSeat = gameController.getCurrentActionSeat();
             int seatIndex = p.getSeatIndex();
 
-            // 1. 处理胡牌 (单局结束)
-            if (action == ActionType.HU) {
-                System.out.println("【单局结束】玩家 " + p.getNickname() + " 宣告胡牌！进行结算...");
+            // ==========================================
+            // 核心分流：判断是“自己的主动回合”还是“他人的被动回合”
+            // ==========================================
+            if (seatIndex == currentActionSeat) {
+                // ---------------- 场景 A：主动回合 ----------------
                 
-                int totalFan = req.getTotalFan();
-                List<String> fanNames = req.getFanNamesList() == null ? new ArrayList<>() : req.getFanNamesList();
-                
-                // 获取当前庄家信息
-                int currentZhuang = 0;
-                int zhuangCount = 1;
-                if (gameController.getRoomManager() != null) {
-                    currentZhuang = gameController.getRoomManager().getCurrentZhuangSeat();
-                    zhuangCount = gameController.getRoomManager().getZhuangGameCount();
-                }
+                if (action == ActionType.HU) {
+                    // 1. 自摸胡牌 (主动发起，无并发冲突)
+                    System.out.println("【单局结束】玩家 " + p.getNickname() + " 宣告自摸胡牌！进行结算...");
+                    
+                    int totalFan = req.getTotalFan();
+                    List<String> fanNames = req.getFanNamesList() == null ? new ArrayList<>() : req.getFanNamesList();
+                    
+                    int currentZhuang = 0;
+                    int zhuangCount = 1;
+                    if (gameController.getRoomManager() != null) {
+                        currentZhuang = gameController.getRoomManager().getCurrentZhuangSeat();
+                        zhuangCount = gameController.getRoomManager().getZhuangGameCount();
+                    }
 
-                // 调用修改后的结算核心
-                RoundSummary summary = gameController.processHu(
-                        seatIndex, onlinePlayers, roomPlayers, totalFan, fanNames,
-                        currentZhuang, zhuangCount
-                );
-                
-                if (summary != null) {
-                    MainMessage msgHu = MainMessage.newBuilder()
-                            .setCode(1008)
-                            .setRoundSummary(summary)
-                            .build();
+                    // 【参数修复】：自摸时，isQiangGang 传 false，targetCard 传 null
+                    RoundSummary summary = gameController.processHu(
+                            seatIndex, onlinePlayers, roomPlayers, totalFan, fanNames,
+                            currentZhuang, zhuangCount, false, null
+                    );
+                    
+                    if (summary != null) {
+                        MainMessage msgHu = MainMessage.newBuilder()
+                                .setCode(1008)
+                                .setRoundSummary(summary)
+                                .build();
 
-                    for (String roomId : roomPlayers) {
-                        Player rp = onlinePlayers.get(roomId);
-                        if (rp != null && rp.getChannel().isActive()) {
-                            rp.getChannel().writeAndFlush(msgHu);
+                        for (String roomId : roomPlayers) {
+                            Player rp = onlinePlayers.get(roomId);
+                            if (rp != null && rp.getChannel().isActive()) {
+                                rp.getChannel().writeAndFlush(msgHu);
+                            }
                         }
                     }
-                }
-            }
-            // 2. 处理出牌
-            else if (action == ActionType.DISCARD) {
-                if (seatIndex == currentActionSeat) {
+                } 
+                else if (action == ActionType.DISCARD) {
+                    // 2. 出牌逻辑
                     CardInfo discardedCard = req.getCard();
-                    
                     Iterator<CardInfo> it = p.getHandCards().iterator();
                     while (it.hasNext()) {
                         CardInfo c = it.next();
@@ -163,57 +165,54 @@ public class MsgDispatcher {
                             break;
                         }
                     }
-                    
+                    // 处理出牌并触发拦截等待
                     gameController.handleDiscardAction(seatIndex, discardedCard, roomPlayers.size());
                     broadcastGameState();
-                }
-            }
-            // 3. 处理摸牌 (包含底线流局检测)
-            else if (action == ActionType.DRAW) {
-                if (seatIndex == currentActionSeat) {
+                } 
+                else if (action == ActionType.DRAW) {
+                    // 3. 摸牌逻辑 (包含底线流局检测)
                     CardInfo drawnCard = gameController.drawOneCard();
                     if (drawnCard != null) {
                         p.getHandCards().add(drawnCard);
                         broadcastGameState();
                     } else {
-                        // 牌山触及 16 张底线，触发流局
+                        // 牌山触及 16 张底线，触发专业流局算法
                         gameController.handleDrawGame(onlinePlayers, roomPlayers);
                     }
-                }
-            }
-            // 4. 处理主动杠牌 (自己回合内的暗杠/补杠)
-            else if (action == ActionType.KONG && seatIndex == currentActionSeat) {
-                System.out.println("【网络中枢】收到玩家 " + seatIndex + " 的主动杠牌请求...");
-                CardInfo targetCard = req.getCard();
-                boolean success = gameController.processSelfKong(seatIndex, targetCard, onlinePlayers, roomPlayers);
-                if (success) {
-                    System.out.println("【网络中枢】主动杠牌执行完毕，生成最新桌面状态并全服广播...");
-                    broadcastGameState(); 
-                } else {
-                    System.out.println("【网络中枢】异常：玩家 " + seatIndex + " 的主动杠牌数据校验未通过！");
-                }
-            }
-            // 5. 处理碰、明杠、吃、过指令 (非单局结束的被动拦截)
-            else if (action == ActionType.PONG || action == ActionType.KONG || action == ActionType.CHI || action == ActionType.PASS) {
-                System.out.println("【网络中枢】收到玩家 " + seatIndex + " 的动作拦截指令: " + action);
-
-                boolean shouldBroadcast = gameController.receiveInterceptAction(
-                        seatIndex, 
-                        action.getNumber(), 
-                        req.getTotalFan(), 
-                        req.getFanNamesList() == null ? new ArrayList<>() : req.getFanNamesList(),
-                        req.getChiCardsList() == null ? new ArrayList<>() : req.getChiCardsList(),
-                        onlinePlayers, 
-                        roomPlayers
-                );
-
-                if (shouldBroadcast) {
-                    System.out.println("【网络中枢】拦截结算完毕，生成最新桌面状态并全服广播...");
-                    broadcastGameState();
-                } else {
-                    if (gameController.getStateMachine().isIntercepting()) {
-                        System.out.println("【网络中枢】动作已记录。仍在等待其他玩家表态...");
+                } 
+                else if (action == ActionType.AN_GANG || action == ActionType.BU_GANG) {
+                    // 4. 主动杠牌逻辑 (暗杠/补杠)
+                    System.out.println("【网络中枢】收到玩家 " + seatIndex + " 的主动杠牌请求...");
+                    CardInfo targetCard = req.getCard();
+                    
+                    // 控制器内部已包含判断：若是暗杠则直接发牌；若是补杠则直接挂起并开启状态机
+                    boolean success = gameController.processSelfKong(seatIndex, targetCard, onlinePlayers, roomPlayers);
+                    
+                    if (success) {
+                        System.out.println("【网络中枢】杠牌流转执行完毕，生成最新桌面状态全服广播...");
+                        broadcastGameState(); 
+                    } else {
+                        System.out.println("【网络中枢】异常：玩家 " + seatIndex + " 的主动杠牌数据校验未通过！");
                     }
+                }
+            } else {
+                // ---------------- 场景 B：被动拦截回合 ----------------
+                
+                // 注意：在别人回合点的 HU（点炮、抢杠胡），必须和碰、吃、杠一起，统统交给状态机进行优胜劣汰！
+                if (action == ActionType.HU || action == ActionType.PONG || action == ActionType.MING_GANG || action == ActionType.CHI || action == ActionType.PASS) {
+                    System.out.println("【网络中枢】收到玩家 " + seatIndex + " 的动作拦截指令: " + action);
+
+                    // 统一推入状态机缓存。
+                    // 状态机运算完毕后，会自动回调 GameController，所以这里不需要接收 boolean 也不需要手动 broadcast
+                    gameController.receiveInterceptAction(
+                            seatIndex, 
+                            action.getNumber(), 
+                            req.getTotalFan(), 
+                            req.getFanNamesList() == null ? new ArrayList<>() : req.getFanNamesList(),
+                            req.getChiCardsList() == null ? new ArrayList<>() : req.getChiCardsList(),
+                            onlinePlayers, 
+                            roomPlayers
+                    );
                 }
             }
         });
@@ -231,7 +230,7 @@ public class MsgDispatcher {
             if (gameController.isAllReadyForNextMatch(roomPlayers.size())) {
                 gameController.clearReadyState();
 
-                // 判定是否打满总局数
+                // 判定是否打满总庄数
                 if (gameController.isGameSessionOver()) {
                     broadcastFinalVictory();
                 } else {
@@ -288,7 +287,7 @@ public class MsgDispatcher {
     }
 
     /**
-     * 广播单局结算小结 (1008) - 弃用或仅供特殊异常兜底使用
+     * 广播单局结算小结 (1008) - 兜底方法
      */
     public static void broadcastRoundSummary(int winnerSeat, String winType) {
         RoundSummary summary = gameController.buildRoundSummary(winnerSeat, winType, roomPlayers);
@@ -308,7 +307,7 @@ public class MsgDispatcher {
      * 执行整场大局终局广播 (1007)
      */
     public static void broadcastFinalVictory() {
-        System.out.println("【终局】总局数已满，推送总榜单 (1007)");
+        System.out.println("【终局】大局圈数已满，推送总榜单 (1007)");
 
         List<Player> sortedPlayers = roomPlayers.stream()
                 .map(onlinePlayers::get)
@@ -323,7 +322,7 @@ public class MsgDispatcher {
         FinalResult.Builder resultBuilder = FinalResult.newBuilder()
                 .setWinnerNickname(winner.getNickname())
                 .setWinningScore(winner.getScore())
-                .setEndReason("打满三圈结束");
+                .setEndReason("打满总圈数结束");
 
         for (int i = 0; i < sortedPlayers.size(); i++) {
             Player p = sortedPlayers.get(i);

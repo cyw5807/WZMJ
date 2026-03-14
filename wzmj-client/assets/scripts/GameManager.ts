@@ -45,7 +45,12 @@ export class GameManager extends Component {
     private currentFanNames: string[] = [];
     private currentTotalFan: number = 0;
 
+    private globalDiscardedHistory: any[] = [];
+
     private isAfterChiPong: boolean = false;   // 记录进入 3N+2 状态的原因。如果是吃/碰带来的，封锁自摸判定
+    private globalMeldStructures: number[][] = []; // 记录每个玩家每个副露里的牌数
+    private activeMeldHighlight: { seat: number, index: number } | null = null;
+    private isFirstSync: boolean = true;
 
     private caishenInfo: CardInfo | null = null; // 财神信息
 
@@ -145,7 +150,7 @@ export class GameManager extends Component {
     // --- 核心渲染逻辑 ---
 
     private onReceiveGameStateSync(msg: MainMessage) {
-        // 消息拦截与暂存：如果贴图还没加载完，先把服务器发来的最新状态存起来，直接 return 中断渲染！
+        // 消息拦截与暂存
         if (!this.isAssetsLoaded) {
             this.pendingGameStateMsg = msg;
             console.log("【系统】贴图仍在加载中，已暂存最新的 1005 桌面同步包...");
@@ -155,24 +160,78 @@ export class GameManager extends Component {
         const data = msg.gameState;
         if (!data) return;
 
-        // 处理财神展示
+        // 【保留核心变量】：判断当前服务器是否挂起了一张目标牌
+        const hasFloatingDiscard = data.lastDiscardedCard !== undefined && data.lastDiscardedCard !== null;
+
+        // ==========================================
+        // 【二维差分引擎】：精准夺取全场唯一高亮
+        // ==========================================
+        if (this.isFirstSync) {
+            this.globalMeldStructures = new Array(data.players ? data.players.length : 4).fill([]);
+        }
+
+        if (data.players) {
+            data.players.forEach((p: any) => {
+                const sIndex = p.seatIndex === undefined ? 0 : p.seatIndex;
+                const currentSets = p.fixedSets || [];
+                // 映射出当前玩家副露的长度数组，例如: [3, 4, 3]
+                const currentStructure = currentSets.map((set: any) => set.cards ? set.cards.length : 0);
+                
+                if (!this.isFirstSync) {
+                    const oldStructure = this.globalMeldStructures[sIndex] || [];
+                    let diffIndex = -1;
+
+                    if (currentStructure.length > oldStructure.length) {
+                        // 算法 A：副露数量增加 (吃、碰、明杠、暗杠)
+                        diffIndex = currentStructure.length - 1;
+                    } else if (currentStructure.length === oldStructure.length) {
+                        // 算法 B：副露数量没变，但某个副露变长了 (补杠)
+                        for (let i = 0; i < currentStructure.length; i++) {
+                            if (currentStructure[i] > oldStructure[i]) {
+                                diffIndex = i;
+                                break;
+                            }
+                        }
+                    } else {
+                        // 算法 C：新开局清空
+                        this.activeMeldHighlight = null;
+                    }
+
+                    // 捕捉到动作，指针指向该副露
+                    if (diffIndex !== -1) {
+                        this.activeMeldHighlight = { seat: sIndex, index: diffIndex };
+                    }
+                }
+                this.globalMeldStructures[sIndex] = currentStructure;
+            });
+        }
+
+        // 【新增互斥法则】：如果发现有人打出了新牌 (牌河变长)，立刻强制熄灭所有副露的高亮！
+        const currentDiscardCount = data.globalDiscardedCards ? data.globalDiscardedCards.length : 0;
+        const oldDiscardCount = this.globalDiscardedHistory ? this.globalDiscardedHistory.length : 0;
+        if (currentDiscardCount > oldDiscardCount) {
+            this.activeMeldHighlight = null;
+        }
+        
+        this.isFirstSync = false;
+
+        // ------------------------------------------
+        // 基础 UI 渲染 (财神、庄家、圈数等)
+        // ------------------------------------------
         if (data.caishenCard) {
             this.caishenInfo = data.caishenCard;
             if (this.caishenDisplayNode) {
                 this.updateCardUI(this.caishenDisplayNode, true, data.caishenCard, false, true);
-                this.setCardNodeTint(this.caishenDisplayNode, new Color(160, 230, 255)); // 蓝色蒙版
+                this.setCardNodeTint(this.caishenDisplayNode, new Color(160, 230, 255));
             }
         }
 
-        // 处理庄家标识
-        const zSeat = data.zhuangSeat === undefined ? 0 : data.zhuangSeat;       // 当前庄家的服务器座位号
-        const zCount = data.zhuangGameCount === undefined ? 1 : data.zhuangGameCount;  // 当前庄家游戏局数
-        const realPlayerCount = data.players ? data.players.length : 0; // 当前实际在场的人数
+        const zSeat = data.zhuangSeat === undefined ? 0 : data.zhuangSeat;       
+        const zCount = data.zhuangGameCount === undefined ? 1 : data.zhuangGameCount;  
+        const realPlayerCount = data.players ? data.players.length : 0; 
 
-        // 先隐藏所有 Label，防止 2 人局显示 4 个 Label 的残留
         this.zhuangLabels.forEach(l => l.node.active = false);
 
-        // 只遍历当前在场的人数
         for (let serverIdx = 0; serverIdx < realPlayerCount; serverIdx++) {
             const localIdx = this.getLocalSeatIndex(serverIdx, realPlayerCount);
             const targetLabel = this.zhuangLabels[localIdx];
@@ -189,14 +248,11 @@ export class GameManager extends Component {
             }
         }
 
-        // 更新圈数显示
         if (this.gameCountLabel) {
-            // 这里的 currentMatchCount 已经被后端重定义为“第几个庄”
             const dealerIndex = data.currentMatchCount;
-            this.gameCountLabel.string = `第 ${dealerIndex} 个庄`;
+            this.gameCountLabel.string = `第 ${dealerIndex} / ${zCount} 庄`;
         }
 
-        // 1. 同步全局回合状态
         this.currentActionSeat = data.currentActionSeat === undefined ? 0 : data.currentActionSeat;
         const totalPlayers = data.players.length;
 
@@ -204,19 +260,12 @@ export class GameManager extends Component {
             this.myServerSeat = this.netManager.getMySeatIndex();
         }
 
-        // 2. 更新全局 UI (牌墙数量、回合提示等)
         if (this.leftCardLabel) {
             const remain = data.remainingCardsCount === undefined ? 0 : data.remainingCardsCount;
             this.leftCardLabel.string = `余 ${remain} 张`;
         }
 
-        if (this.gameCountLabel) {
-            const curMatch = data.currentMatchCount === undefined ? 0 : data.currentMatchCount;
-            const totalMatch = data.totalMatchCount === undefined ? 0 : data.totalMatchCount;
-            this.gameCountLabel.string = `第 ${curMatch} / ${totalMatch} 局`;
-        }
-        
-        this.interactionMode = 'NORMAL'; // 无论如何先切回正常模式
+        this.interactionMode = 'NORMAL'; 
 
         const isMyTurn = (this.currentActionSeat === this.myServerSeat);
         if (this.turnStatusLabel) {
@@ -228,18 +277,15 @@ export class GameManager extends Component {
                 this.turnStatusLabel.color = new Color(255, 255, 255);
             }
         }
+        
         if (!isMyTurn) {
             this.isAfterChiPong = false;
         }
 
         this.resetActionButtons();
-
-        // 3. 清理个人牌区 (注意：中心公牌区交由增量逻辑处理，这里不再 clearTable 全清)
         this.clearPersonalTable();
 
-        // --- 重置拦截锁逻辑 ---
-        // 遍历所有玩家，只要发现有任何一个人的手牌处于 3N+2 状态，
-        // 就说明当前正处于“某人的思考出牌期”，上一个拦截窗口已经彻底结束！
+        // 拦截锁重置逻辑
         let isAnyPlayerActive = false;
         const playersList = data.players || [];
         for (let p of playersList) {
@@ -249,18 +295,19 @@ export class GameManager extends Component {
             }
         }
 
-        // 只要有人在出牌，立刻重置拦截锁，为下一次别人打牌做好准备
         if (isAnyPlayerActive) {
             this.isInterceptLockActive = false;
         }
 
-        // 4. 遍历玩家数据，渲染各个席位
-        data.players.forEach(player => {
+        // ------------------------------------------
+        // 遍历玩家进行渲染
+        // ------------------------------------------
+        data.players.forEach((player: any) => {
             const sIndex = player.seatIndex === undefined ? 0 : player.seatIndex; 
             const isMe = (sIndex === this.myServerSeat);
             const logicalIndex = this.getLocalSeatIndex(sIndex, totalPlayers);
 
-            // 渲染信息面板
+            // 信息面板
             if (this.nameLabels[logicalIndex]) {
                 this.nameLabels[logicalIndex].string = player.nickname || "未知玩家";
                 this.nameLabels[logicalIndex].node.active = true;
@@ -270,8 +317,6 @@ export class GameManager extends Component {
                 this.scoreLabels[logicalIndex].string = `${currentScore} 分`;
                 this.scoreLabels[logicalIndex].color = new Color(184, 134, 11); 
             }
-
-            // 标识是否正在行动
             if (this.typeLabels[logicalIndex]) {
                 const label = this.typeLabels[logicalIndex];
                 if (sIndex === this.currentActionSeat) {
@@ -284,18 +329,16 @@ export class GameManager extends Component {
             }
 
             // ==========================================
-            // 渲染成牌区 (碰/杠/吃的牌)
+            // 渲染成牌区 (碰/杠/吃)
             // ==========================================
             const seatNode = this.seatNodes[logicalIndex];
             if (seatNode) {
                 seatNode.removeAllChildren(); 
                 
                 const fixedSets = player.fixedSets || [];
-                fixedSets.forEach(cardSet => {
-                    // 浅拷贝数组，防止修改原始数据
+                fixedSets.forEach((cardSet: any, setIndex: number) => {
                     const cards = cardSet.cards ? [...cardSet.cards] : [];
                     
-                    // 严密排序：按类型和数值从小到大
                     cards.sort((a, b) => {
                         const typeA = a.type === undefined ? 0 : a.type;
                         const typeB = b.type === undefined ? 0 : b.type;
@@ -305,68 +348,77 @@ export class GameManager extends Component {
                         return valA - valB; 
                     });
 
-                    // 动态创建内层包裹节点
                     const setContainerNode = new Node("CardSetContainer");
                     const setLayout = setContainerNode.addComponent(Layout);
-                    
-                    // 内层 Layout 设置为从左到右水平排列
                     setLayout.type = Layout.Type.HORIZONTAL;
-                    // 必须设为 CONTAINER，包裹节点才能贴合内部卡牌的实际宽度
                     setLayout.resizeMode = Layout.ResizeMode.CONTAINER; 
-                    setLayout.spacingX = 5; // 内部 3 张或 4 张牌之间的间距
-
-                    // 将包裹节点加入到外层 SeatNode 中
+                    setLayout.spacingX = 5; 
                     seatNode.addChild(setContainerNode);
 
-                    cards.forEach(cardData => {
+                    const actionType = cardSet.type;
+                    const targetCard = cardSet.targetCard;
+                    let hasHighlightedTarget = false; 
+
+                    // 【核心互斥研判】：绝对匹配差分指针
+                    const isThisMeldHighlighted = this.activeMeldHighlight !== null && 
+                                                  this.activeMeldHighlight.seat === sIndex && 
+                                                  this.activeMeldHighlight.index === setIndex;
+
+                    cards.forEach((cardData, cardIdx) => {
                         const cardNode = instantiate(this.cardPrefab);
                         setContainerNode.addChild(cardNode);
                         
                         cardData.type = cardData.type === undefined ? 0 : cardData.type;
                         cardData.value = cardData.value === undefined ? 0 : cardData.value;
-                        this.updateCardUI(cardNode, true, cardData); 
+                        
+                        let isHighlight = false;
+                        if (isThisMeldHighlighted) { 
+                            if (actionType === ActionType.AN_GANG) {
+                                isHighlight = true; 
+                            } else if (actionType === ActionType.BU_GANG) {
+                                if (cardIdx === 3) isHighlight = true; 
+                            } else {
+                                if (targetCard && !hasHighlightedTarget && 
+                                    cardData.type === targetCard.type && cardData.value === targetCard.value) {
+                                    isHighlight = true;
+                                    hasHighlightedTarget = true;
+                                }
+                            }
+                        }
+
+                        this.updateCardUI(cardNode, true, cardData, isHighlight); 
                     });
                 });
             }
 
             // ==========================================
-            // 渲染我的手牌区及核心拦截判定
+            // 渲染我的手牌区
             // ==========================================
             if (isMe) {
-                // 将手牌与副露数据存入全局变量，供其他方法调用
                 this.myHandCardsData = player.handCards || [];
                 this.myFormedSetsData = player.fixedSets || [];
 
-                // 清空旧的手牌节点
                 if (this.handArea) {
                     this.handArea.removeAllChildren(); 
                 }
 
-                // 浅拷贝一份数组用于操作
                 const handCards = [...this.myHandCardsData]; 
                 let sortedCards: any[] = [];
                 let newDrawnCard: any = null;
-                let isRightmostHighlight = false; // 用于标记吃碰后，最右侧牌是否需要高亮
+                let isRightmostHighlight = false; 
 
-                // 根据 3N+2 状态的原因，采取不同的排序策略
                 if (handCards.length % 3 === 2) {
                     if (this.isAfterChiPong) {
-                        // 场景 A：吃/碰后进入 3N+2
-                        // 所有人都要参与排序，最右侧的那张牌强制高亮
                         sortedCards = [...handCards];
                         isRightmostHighlight = true;
                     } else {
-                        // 场景 B：摸牌/杠牌后进入 3N+2
-                        // 剥离最后一张摸到的牌，它不参与排序，永远在最右侧
                         newDrawnCard = handCards.pop(); 
                         sortedCards = [...handCards];          
                     }
                 } else {
-                    // 正常 3N+1 状态（回合外或刚出完牌）
                     sortedCards = [...handCards];
                 }
 
-                // 严格双重排序 (财神最左 -> 类型 -> 数值)
                 sortedCards.sort((a, b) => {
                     const isAJoker = (a.type === 4 && a.value === 5);
                     const isBJoker = (b.type === 4 && b.value === 5);
@@ -382,120 +434,108 @@ export class GameManager extends Component {
                     return valA - valB; 
                 });
 
-                // 渲染基础/已排序手牌
+                const realHandCountUI = this.myHandCardsData.length;
+                const isMyTurnActive = (this.currentActionSeat === this.myServerSeat && realHandCountUI % 3 === 2);
+
                 sortedCards.forEach((cardData, index) => {
                     const cardNode = instantiate(this.cardPrefab);
                     this.handArea.addChild(cardNode);
                     cardNode.on(Node.EventType.TOUCH_END, this.onHandCardClick, this);
                     
-                    // 如果是吃碰后的 3N+2 状态，并且当前渲染的是排序后的最后一张，给予淡黄色高亮
                     let isHighlight = false;
                     if (isRightmostHighlight && index === sortedCards.length - 1) {
                         isHighlight = true;
                     }
+
+                    const isRestricted = isMyTurnActive ? !this.getPlayableStatus(cardData.type, cardData.value) : false;
                     
-                    this.updateCardUI(cardNode, true, cardData, isHighlight); 
+                    this.updateCardUI(cardNode, true, cardData, isHighlight, false, isRestricted); 
                 });
 
-                // 渲染新摸到的、不参与排序的牌 (如果有)
                 if (newDrawnCard) {
                     const cardNode = instantiate(this.cardPrefab);
                     this.handArea.addChild(cardNode);
                     cardNode.on(Node.EventType.TOUCH_END, this.onHandCardClick, this);
                     
-                    // 第四个参数传 true，触发新牌淡黄色高亮
-                    // 注意：如果摸到的是白板(真财神)，由于 updateCardUI 内部的优先级，它依然会显示为蓝色
-                    this.updateCardUI(cardNode, true, newDrawnCard, true); 
+                    const isRestricted = isMyTurnActive ? !this.getPlayableStatus(newDrawnCard.type, newDrawnCard.value) : false;
+                    this.updateCardUI(cardNode, true, newDrawnCard, true, false, isRestricted); 
                 }
 
                 // ==========================================
-                // 拦截与动作判定通道
+                // 动作拦截与通道判定
                 // ==========================================
                 const lastDiscard = data.lastDiscardedCard; 
                 this.currentChiTargetCard = lastDiscard;
                 const remain = data.remainingCardsCount === undefined ? 0 : data.remainingCardsCount;
                 const realHandCount = this.myHandCardsData.length;
 
-                // 场景 A：我的回合 (真实手牌数为 3N+2) - 自摸、暗杠、补杠
+                // 场景 A：我的回合 (自摸、暗杠、补杠)
                 if (this.currentActionSeat === this.myServerSeat && realHandCount % 3 === 2) {
                     if (!this.isAfterChiPong) {
                         log("【系统】我的回合，执行自摸与主动判定...");
                         
-                        // 1. 自摸检测 (必须传入完整的 myHandCardsData)
                         const huResult = this.checkCanHu(this.myHandCardsData, null, this.myFormedSetsData); 
                         if (huResult && huResult.canHu) { 
                             this.currentTotalFan = huResult.totalFan === undefined ? 0 : huResult.totalFan;
                             this.currentFanNames = huResult.fanNames || [];
-                            log(`【系统】自摸判定通过！番数: ${this.currentTotalFan}`);
                             
                             this.setActionButtonState(this.btnHu, true, 250, 33, 33); 
                             this.setActionButtonState(this.btnPass, true, 255, 255, 255);
                         }
 
-                        // 2. 主动杠牌检测 (必须传入完整的 myHandCardsData)
                         if (remain > 0 && this.checkCanAnOrBuKong(this.myHandCardsData, this.myFormedSetsData)) {
-                            log("【系统】暗杠/补杠判定通过！");
                             this.setActionButtonState(this.btnKong, true, 252, 222, 69); 
                             this.setActionButtonState(this.btnPass, true, 255, 255, 255);
                         }
                     }
                 }
                 
-                // 场景 B：别人的回合 (真实手牌数为 3N+1) - 点炮、明杠、碰、吃
+                // 场景 B：他人的回合 (点炮、明杠、碰、吃)
                 else if (this.currentActionSeat !== this.myServerSeat && realHandCount % 3 === 1 && lastDiscard && !isAnyPlayerActive) {
                     log("【系统】他人回合，执行外部拦截判定...");
-
                     let hasAnyAction = false;
                     
-                    // 1. 点炮检测 (传入完整的 myHandCardsData)
+                    // 1. 胡牌(点炮/抢杠)无视任何物理通道封锁，绝对优先检测
                     const huResult = this.checkCanHu(this.myHandCardsData, lastDiscard, this.myFormedSetsData); 
                     if (huResult && huResult.canHu) { 
                         this.currentTotalFan = huResult.totalFan === undefined ? 0 : huResult.totalFan;
                         this.currentFanNames = huResult.fanNames || [];
-                        log(`【系统】点炮判定通过！番数: ${this.currentTotalFan}`);
                         
                         this.setActionButtonState(this.btnHu, true, 250, 33, 33); 
                         this.setActionButtonState(this.btnPass, true, 255, 255, 255);
                         hasAnyAction = true;
                     }
 
-                    if (remain > 0) { 
-                        // 2. 明杠检测
+                    // 【核心安全防线】：利用 hasFloatingDiscard 判定当前是否处于抢杠胡挂起期！
+                    const isQiangGangWindow = this.activeMeldHighlight !== null && 
+                                              this.activeMeldHighlight.seat === this.currentActionSeat && 
+                                              hasFloatingDiscard;
+
+                    if (remain > 0 && !isQiangGangWindow) { 
+                        // 常规拦截通道
                         if (this.checkCanMingKong(this.myHandCardsData, lastDiscard)) {
-                            log("【系统】明杠判定通过！");
                             this.setActionButtonState(this.btnKong, true, 252, 222, 69);
                             this.setActionButtonState(this.btnPass, true, 255, 255, 255);
                             hasAnyAction = true;
                         }
-
-                        // 3. 碰牌检测
                         if (this.checkCanPong(this.myHandCardsData, lastDiscard)) {
-                            log("【系统】碰牌判定通过！");
                             this.setActionButtonState(this.btnPong, true, 36, 141, 255); 
                             this.setActionButtonState(this.btnPass, true, 255, 255, 255);
                             hasAnyAction = true;
                         }
-
-                        // 4. 吃牌检测 
                         const isShangJia = (this.myServerSeat - 1 + totalPlayers) % totalPlayers === this.currentActionSeat;
                         if (isShangJia && this.checkCanChi(this.myHandCardsData, lastDiscard)) {
-                            log("【系统】吃牌判定通过！");
                             this.setActionButtonState(this.btnChi, true, 124, 36, 255); 
                             this.setActionButtonState(this.btnPass, true, 255, 255, 255);
                             hasAnyAction = true;
                         }
-                    } else {
-                        log("【系统】牌山已空，关闭吃/碰/杠物理通道，仅保留胡牌判定。");
+                    } else if (isQiangGangWindow) {
+                        log("【系统】当前处于抢杠胡绝对挂起期，封锁物理吃/碰/杠！");
                     }
 
                     if (!hasAnyAction) {
-                        // 只有在锁是打开的状态下，才发送自动过牌
                         if (!this.isInterceptLockActive) {
-                            log("【系统】无任何可拦截操作，前端自动发送“过”放行状态机...");
-                            
-                            // 瞬间上锁！在这个拦截窗口彻底结束前，绝对不发第二次 PASS
                             this.isInterceptLockActive = true; 
-                            
                             if (this.netManager) {
                                 this.netManager.sendPlayerAction(ActionType.PASS);
                             }
@@ -505,27 +545,110 @@ export class GameManager extends Component {
             }
         });
 
-        // 5. 基于后端的渲染逻辑
-        const historyDiscards = data.globalDiscardedCards || [];
+        // ------------------------------------------
+        // 渲染牌河与全局高亮调用
+        // ------------------------------------------
+        // 此时将本次历史数据覆盖到本地，用于下一次比较
+        this.globalDiscardedHistory = data.globalDiscardedCards || [];
+        
         const currentUINodesCount = this.centerArea ? this.centerArea.children.length : 0;
-
-        // 判定 1：新局开始，后端记录为空，前端立刻清场
-        if (historyDiscards.length === 0 && this.centerArea) {
+        if (this.globalDiscardedHistory.length === 0 && this.centerArea) {
             this.centerArea.removeAllChildren();
-        } 
-        // 判定 2：正常推进，追加渲染新增的弃牌（节约性能，保留已有节点的动画）
-        else if (historyDiscards.length > currentUINodesCount) {
-            for (let i = currentUINodesCount; i < historyDiscards.length; i++) {
-                this.appendDiscardedCard(historyDiscards[i]);
+        } else if (this.globalDiscardedHistory.length > currentUINodesCount) {
+            for (let i = currentUINodesCount; i < this.globalDiscardedHistory.length; i++) {
+                this.appendDiscardedCard(this.globalDiscardedHistory[i]);
+            }
+        } else if (this.globalDiscardedHistory.length < currentUINodesCount) {
+            if (this.centerArea) this.centerArea.removeAllChildren();
+            this.globalDiscardedHistory.forEach((card: any) => this.appendDiscardedCard(card));
+        }
+
+        // 调用互斥的牌河高亮渲染
+        this.highlightLastDiscard();
+    }
+
+    /**
+     * 刷新牌河高亮：实现了与副露高亮的绝对互斥
+     */
+    private highlightLastDiscard() {
+        if (!this.centerArea || this.centerArea.children.length === 0) return;
+
+        // 互斥法则：如果全局差分算法显示有任何副露正在发光，牌河绝对不准发光！
+        const canHighlight = (this.activeMeldHighlight === null); 
+
+        const children = this.centerArea.children;
+        children.forEach((cardNode, index) => {
+            const isLast = (index === children.length - 1);
+            
+            if (isLast && canHighlight) {
+                this.setCardNodeTint(cardNode, new Color(255, 255, 150));
+            } else {
+                this.setCardNodeTint(cardNode, Color.WHITE);
+            }
+        });
+    }
+
+    /**
+     * 获取某张牌当前是否允许被打出
+     * @returns true: 可以打出 / false: 被风牌规则锁定，禁止打出
+     */
+    private getPlayableStatus(cardType: number, cardValue: number): boolean {
+        // 1. 真财神（白板）在任何情况下都绝对禁止打出
+        if (cardType === 4 && cardValue === 5) return false;
+
+        // 2. 统计手牌中的风牌数量
+        const windCounts = new Map<number, number>();
+        for (const c of this.myHandCardsData) {
+            const cType = c.type === undefined ? 0 : c.type;
+            const cVal = c.value === undefined ? 0 : c.value;
+            if (cType === 4 && cVal >= 1 && cVal <= 4) {
+                windCounts.set(cVal, (windCounts.get(cVal) || 0) + 1);
             }
         }
-        // 判定 3：极端异常（如重连后发现本地弃牌数量多于服务端），全量重绘
-        else if (historyDiscards.length < currentUINodesCount) {
-            if (this.centerArea) this.centerArea.removeAllChildren();
-            historyDiscards.forEach(card => this.appendDiscardedCard(card));
+
+        // 3. 触发检测：寻找是否有数量为 1 的“单张风”
+        let hasSingleWind = false;
+        for (const count of windCounts.values()) {
+            if (count === 1) {
+                hasSingleWind = true;
+                break;
+            }
         }
 
-        this.highlightLastDiscard();
+        // 如果没有单张风，规则不触发，任何非财神的牌都可以打
+        if (!hasSingleWind) return true;
+
+        // 4. 交集检测：寻找牌河里的风
+        const discardWinds = new Set<number>();
+        for (const c of this.globalDiscardedHistory) {
+            const cType = c.type === undefined ? 0 : c.type;
+            const cVal = c.value === undefined ? 0 : c.value;
+            if (cType === 4 && cVal >= 1 && cVal <= 4) {
+                discardWinds.add(cVal);
+            }
+        }
+
+        const intersection = new Set<number>();
+        for (const windVal of windCounts.keys()) {
+            if (discardWinds.has(windVal)) {
+                intersection.add(windVal);
+            }
+        }
+
+        // 5. 判决输出
+        // 如果想打的这张牌是风牌
+        if (cardType === 4 && cardValue >= 1 && cardValue <= 4) {
+            if (intersection.size > 0) {
+                // 有交集：必须打交集里的风（跟风）
+                return intersection.has(cardValue);
+            } else {
+                // 无交集：手里的任何风都可以打
+                return true;
+            }
+        } else {
+            // 如果想打的不是风牌，直接禁止
+            return false;
+        }
     }
 
     /**
@@ -708,24 +831,6 @@ export class GameManager extends Component {
         this.updateCardUI(cardNode, true, cardData);
     }
 
-    /**
-     * 刷新牌河高亮：仅将最后一张打出的牌设为淡黄色
-     */
-    private highlightLastDiscard() {
-        if (!this.centerArea || this.centerArea.children.length === 0) return;
-
-        // 1. 先把牌河里所有的牌“洗白”，恢复成正常的纯白色
-        this.centerArea.children.forEach(cardNode => {
-            this.setCardNodeTint(cardNode, Color.WHITE);
-        });
-
-        // 2. 揪出最后一张被打出的牌（数组里的最后一个节点）
-        const lastCardNode = this.centerArea.children[this.centerArea.children.length - 1];
-        
-        // 3. 将其高亮为极其舒适的淡黄色
-        this.setCardNodeTint(lastCardNode, new Color(255, 255, 150));
-    }
-
     // --- 交互与操作逻辑 ---
 
     private onHandCardClick(event: any) {
@@ -756,19 +861,17 @@ export class GameManager extends Component {
                     return;
                 }
 
-                // 严禁打出真财神 (底层数据为 白板 4, 5 的牌)
-                if (cardUI.type === 4 && cardUI.value === 5) {
-                    log("【警告】财神牌不可打出！");
-                    cardUI.resetState();
-                    this.selectedCardNode = null;
-                    return; 
-                }
-
                 if (this.handArea.children.length % 3 !== 2) {
                     log(`提示：当前手牌数为 ${this.handArea.children.length}，不符合出牌状态！`);
                     cardUI.resetState();
                     this.selectedCardNode = null;
                     return;
+                }
+
+                const isPlayable = this.getPlayableStatus(cardUI.type, cardUI.value);
+                if (!isPlayable) {
+                    log("规则限制，此牌当前不可出！");
+                    return; 
                 }
 
                 if (this.netManager) {
@@ -919,11 +1022,12 @@ export class GameManager extends Component {
             }
         }
 
-        let isValidKong = false;
+        let isAnGang = false;
+        let isBuGang = false;
         let kongTypeStr = "";
 
         if (handMatchCount === 4) {
-            isValidKong = true;
+            isAnGang = true;
             kongTypeStr = "暗杠";
         } else {
             // 情况 B：是否构成补杠（手牌中有 1 张，且副露区有对应的碰牌）
@@ -934,7 +1038,7 @@ export class GameManager extends Component {
                         const setCardType = set.cards[0].type === undefined ? 0 : set.cards[0].type;
                         const setCardVal = set.cards[0].value === undefined ? 0 : set.cards[0].value;
                         if (setCardType === targetType && setCardVal === targetVal) {
-                            isValidKong = true;
+                            isBuGang = true;
                             kongTypeStr = "补杠";
                             break;
                         }
@@ -944,7 +1048,7 @@ export class GameManager extends Component {
         }
 
         // 4. 判决执行
-        if (isValidKong) {
+        if (isAnGang || isBuGang) {
             log(`【系统】审查通过！执行${kongTypeStr}，牌型: ${targetType}+${targetVal}`);
             
             // 直接平铺传参即可
@@ -954,7 +1058,11 @@ export class GameManager extends Component {
             };
             
             if (this.netManager) {
-                this.netManager.sendPlayerAction(ActionType.KONG, actionData);
+                if (isAnGang) {
+                    this.netManager.sendPlayerAction(ActionType.AN_GANG, actionData);
+                } else if (isBuGang) {
+                    this.netManager.sendPlayerAction(ActionType.BU_GANG, actionData);
+                }
             }
             
             this.resetActionButtons();
@@ -1016,7 +1124,7 @@ export class GameManager extends Component {
             // 场景 1：非自己回合，绝对是明杠，直接向服务器提交动作申请
             if (this.netManager) {
                 log("【动作】发送明杠指令...");
-                this.netManager.sendPlayerAction(ActionType.KONG);
+                this.netManager.sendPlayerAction(ActionType.MING_GANG);
                 this.resetActionButtons();
             }
         } else {
@@ -1144,19 +1252,18 @@ export class GameManager extends Component {
                         // 强制给正数加上 '+' 号，增加视觉辨识度
                         const changeStr = changeVal > 0 ? `+${changeVal}` : `${changeVal}`;
                         const totalStr = info.currentTotalScore === undefined ? 0 : info.currentTotalScore;
-                        
+                        const jCount = info.jokerCount === undefined ? 0 : info.jokerCount;
+
                         // 根据结算类型，采用不同的排版格式
                         if (isRoundSummary) {
-                            label.string = `${index + 1}. ${name} / 本局 ${changeStr} / 总分 ${totalStr}`;
+                            label.string = `玩家 ${name} / 财神 ${jCount} 张 / 本局 ${changeStr} / 总分 ${totalStr}`;
                         } else {
                             label.string = `${index + 1}. ${name} ——  ${totalStr} 分`;
                         }
                         
-                        // 【核心修改】：如果是“我”，用醒目的深黄色或红色高亮；其他人用黑色
+                        // 如果是“我”，用醒目的深黄色或红色高亮；其他人用黑色
                         if (sIndex === this.myServerSeat) {
                             label.color = new Color(165, 154, 25); // 这里填你想高亮的颜色
-                            // 可选：给名字加个 (我) 的标识
-                            // label.string = label.string.replace(name, `${name} (我)`);
                         } else {
                             label.color = new Color(0, 0, 0); // 其他人黑色
                         }
@@ -1254,7 +1361,7 @@ export class GameManager extends Component {
 
     // --- 视觉与数据转换辅助 ---
     // 第五个参数 isRaw 代表是否原样渲染，默认为 false
-    private updateCardUI(cardNode: Node, isFaceUp: boolean, info: any, isNewlyDrawn: boolean = false, isRaw: boolean = false) {
+    private updateCardUI(cardNode: Node, isFaceUp: boolean, info: any, isNewlyDrawn: boolean = false, isRaw: boolean = false, isRestricted: boolean = false) {
         const cardUI = cardNode.getComponent(CardUI);
         if (cardUI && info) {
             cardUI.type = info.type; 
@@ -1310,6 +1417,8 @@ export class GameManager extends Component {
         let targetColor = Color.WHITE;
         if (isJoker) {
             targetColor = new Color(160, 230, 255); // 真财神：永远优先是蓝色
+        } else if (isRestricted) {
+            targetColor = new Color(170, 170, 170); 
         } else if (isNewlyDrawn) {
             targetColor = new Color(255, 255, 150); // 最右侧的新牌：淡黄色
         }
@@ -1416,7 +1525,7 @@ export class GameManager extends Component {
      * @param formedSets 玩家已经摆在桌面的组合数组 (吃、碰、杠)
      * @returns 判定结果、总番数、番型名称列表
      */
-    private checkCanHu(handCards: any[], targetCard: any | null, formedSets: any[]): { canHu: boolean, totalFan: number, fanNames: string[] } {
+    private checkCanHu(handCards: any[], targetCard: any | null, formedSets: any[], isQiangGang: boolean = false): { canHu: boolean, totalFan: number, fanNames: string[] } {
         if (!handCards) return { canHu: false, totalFan: 0, fanNames: [] };
         
         let canHu = false;
@@ -1501,7 +1610,7 @@ export class GameManager extends Component {
                 if (isEightPairs) {
                     totalFan = 2; fanNames.push("硬八对");
                 } else {
-                    totalFan = 1; fanNames.push("硬平胡");
+                    totalFan = 1; fanNames.push("硬胡");
                 }
             } 
             else {
@@ -1518,8 +1627,10 @@ export class GameManager extends Component {
                     // 核心修复：使用 this.isAfterChiPong 判断是否属于吃碰后当回合的“假自摸”
                     if (isZiMo && !this.isAfterChiPong) {
                         totalFan = 1; fanNames.push("自摸");
+                    } else if (isQiangGang) {
+                        totalFan = 1; fanNames.push("抢杠");
                     } else {
-                        // 不是合法自摸，验证【财神归位】
+                        // 不是自摸，验证【财神归位】
                         let isGuiWei = false;
                         if (this.caishenInfo && jokerCount >= 1) {
                             // 降维回溯：抽离 1 张万能牌，将它的“原皮”作为实体牌塞入，重新测算
@@ -1540,7 +1651,7 @@ export class GameManager extends Component {
                             totalFan = 1; fanNames.push("财神归位");
                         } else {
                             // 强行用财神填补了其他窟窿，就是 0 番（屁胡）
-                            totalFan = 0; fanNames.push("平胡");
+                            totalFan = 0; fanNames.push("软胡");
                         }
                     }
                 }

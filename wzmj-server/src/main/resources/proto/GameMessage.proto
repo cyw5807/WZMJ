@@ -18,16 +18,19 @@ enum ActionType {
     DRAW = 0;        // 摸牌
     DISCARD = 1;     // 出牌
     PONG = 2;        // 碰
-    KONG = 3;        // 杠
+    MING_GANG = 3;   // 明杠
     HU = 4;          // 胡
     CHI = 5;         // 吃（当前项目暂不启用，但保留协议支持）
     PASS = 6;        // 过（放弃操作）
+    AN_GANG = 7;     // 暗杠
+    BU_GANG = 8;     // 补杠
 }
 
 // 固定的牌组（碰、杠、吃的牌）
 message CardSet {
     ActionType type = 1;      // 组类型
     repeated CardInfo cards = 2; // 组内的牌
+    CardInfo targetCard = 3;  // 记录被交互的那张目标牌，用于前端高亮
 }
 
 // 玩家在游戏中的实时状态
@@ -109,6 +112,7 @@ message PlayerRoundScore {
     string nickname = 2;
     int32 scoreChange = 3;       
     int32 currentTotalScore = 4; 
+    int32 jokerCount = 5;        // 记录该玩家本局的财神个数
 }
 
 // 1008: 单局结算报告 (由服务器推发)

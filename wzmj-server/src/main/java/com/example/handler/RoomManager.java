@@ -55,6 +55,15 @@ public class RoomManager {
         return totalDealerShift > (this.roomSize * 3);
     }
 
+    /**
+     * 荒庄无杠情况下的特殊处理：
+     * 庄家座位不变，连庄计数不变，全场总庄数不变。状态机陷入停滞。
+     */
+    public void retainZhuangWithoutIncrement() {
+        // 无需执行任何变量的加减运算
+        System.out.println("【房间管理】庄家指针锁定在座位：" + this.currentZhuangSeat + "，连庄数维持在：" + this.zhuangGameCount);
+    }
+
     // --- Getters ---
     public int getCurrentZhuangSeat() { return currentZhuangSeat; }
     public int getZhuangGameCount() { return zhuangGameCount; }
